@@ -1,0 +1,15 @@
+# Personal files — never commit these.
+config
+history.log
+
+# Secrets, defensively (config above is the real risk)
+*.env
+.env.*
+*MYPASS*
+*password*
+
+# macOS / editor noise
+.DS_Store
+.vscode/
+.idea/
+*.swp

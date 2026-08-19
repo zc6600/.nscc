@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""
+nscc — helper to submit jobs to NSCC ASPIRE 2A.
+
+Key auth is not enabled for this account, so the password must be typed for
+every SSH connection. Driving rsync/scp directly through expect corrupts
+their binary protocol (expect's pty sits in the data path), so instead we:
+
+  1. open ONE ControlMaster connection through expect, answering the password
+     prompt from $MYPASS_XL (the master then persists for 10 minutes), and
+  2. run every ssh/rsync/qsub as a multiplexed slave of that master — no
+     password, no pty in the data path.
+
+Usage:
+    nscc init                               create a ~/.nscc/config template
+    nscc submit <project-path> <pbs-file>   upload project & qsub the job
+    nscc fetch <url> <project-name>         download a URL directly on NSCC
+    nscc pull <remote-path> <local-path>    copy files from NSCC to this machine
+    nscc run "<command>"                    run a command on the login node
+    nscc status                             qstat for this user
+    nscc log [job-id] [--err] [-f]          show job stdout/stderr (follow with -f)
+    nscc del <job-id>                       qdel a job
+    nscc ssh                                interactive login shell
+    nscc close                              tear down the master connection
+
+Every action is appended to ~/.nscc/history.log (one line per action).
+
+Per-user settings live in ~/.nscc/config (create with `nscc init`):
+
+    [nscc]
+    host = your-user@aspire2a.nus.edu.sg   ; or an ~/.ssh/config alias
+    remote_base = ~/nscc_submit
+    password_env = MYPASS_XL                ; env var holding your password
+
+Requires: expect (brew), rsync.
+"""
+
+import argparse
+import configparser
+import datetime
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+CONFIG_DIR = os.path.expanduser("~/.nscc")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
+HISTORY_LOG = os.path.join(CONFIG_DIR, "history.log")
+CONTROL_PATH = "~/.ssh/nscc-%C"
+
+DEFAULTS = {
+    "host": "nscc",                 # ~/.ssh/config alias
+    "remote_base": "~/nscc_submit",
+    "password_env": "MYPASS_XL",
+    # "password": ""                # optional; see nscc init template
+}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    parser = configparser.ConfigParser()
+    if os.path.exists(CONFIG_PATH):
+        parser.read(CONFIG_PATH)
+        if parser.has_section("nscc"):
+            for key, value in parser.items("nscc"):
+                if key in cfg or key == "password":
+                    cfg[key] = value.strip()
+    return cfg
+
+
+CFG = load_config()
+HOST = CFG["host"]
+REMOTE_BASE = CFG["remote_base"]
+
+SSH_OPTS = [
+    "-o", "ControlMaster=auto",
+    "-o", f"ControlPath={CONTROL_PATH}",
+    "-o", "ControlPersist=10m",
+]
+RSYNC_SSH = "ssh " + " ".join(SSH_OPTS)
+
+EXPECT_SCRIPT = r'''
+# argv: <command...> — spawn the command, answer the SSH password prompt,
+# then let it run to completion. Password comes from NSCC_PASS (set by the
+# Python wrapper from ~/.nscc/config or the configured env var).
+set cmd [lrange $argv 0 end]
+if {[llength $cmd] == 0} {
+    puts stderr "usage: expect-script <command...>"
+    exit 2
+}
+if {![info exists env(NSCC_PASS)] || $env(NSCC_PASS) eq ""} {
+    puts stderr "no password configured (see: nscc init)"
+    exit 2
+}
+set pw $env(NSCC_PASS)
+set timeout -1
+spawn {*}$cmd
+expect {
+    -re "(?i)yes/no" {
+        # first-time host key confirmation
+        send "yes\r"
+        exp_continue
+    }
+    -re "(?i)password:" {
+        send "$pw\r"
+        exp_continue
+    }
+    eof {}
+}
+if {[catch {wait} result]} {
+    exit 1
+}
+exit [lindex $result 3]
+'''
+
+
+def die(msg):
+    log_action("error", msg)
+    print(f"[nscc] error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def log_action(action, detail="", result=""):
+    """Append one line per action to ~/.nscc/history.log."""
+    try:
+        with open(HISTORY_LOG, "a") as f:
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{stamp}\t{action}\t{detail}\t{result}\n")
+    except OSError:
+        pass  # logging must never break the actual work
+
+
+def get_password():
+    """Password from ~/.nscc/config ('password' key), else the configured
+    env var (default MYPASS_XL)."""
+    if CFG.get("password"):
+        return CFG["password"]
+    return os.environ.get(CFG["password_env"], "")
+
+
+def run_expect(cmd, check=True):
+    """Run cmd (argv list) under expect, answering the SSH password prompt."""
+    expect_bin = shutil.which("expect")
+    if not expect_bin:
+        die("'expect' not found — install it with: brew install expect")
+    password = get_password()
+    if not password:
+        die(
+            f"no password found — set ${CFG['password_env']} or run: nscc init"
+        )
+
+    env = dict(os.environ, NSCC_PASS=password)
+    fd, script = tempfile.mkstemp(suffix=".exp", prefix="nscc-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(EXPECT_SCRIPT)
+        proc = subprocess.run([expect_bin, script, *cmd], env=env)
+    finally:
+        os.unlink(script)
+
+    if check and proc.returncode != 0:
+        die(f"command failed with exit code {proc.returncode}: {' '.join(cmd)}")
+    return proc.returncode
+
+
+def ensure_master():
+    """Open (or reuse) the ControlMaster connection; enters password once."""
+    return run_expect(["ssh", *SSH_OPTS, HOST, "true"])
+
+
+def ssh_run(command, check=True, capture=False):
+    """Run a command on NSCC over the multiplexed master connection."""
+    ensure_master()
+    proc = subprocess.run(
+        ["ssh", *SSH_OPTS, HOST, command],
+        capture_output=capture,
+        text=capture,
+    )
+    if check and proc.returncode != 0:
+        die(f"remote command failed ({proc.returncode}): {command}")
+    return proc.stdout if capture else proc.returncode
+
+
+def cmd_submit(args):
+    project = Path(args.project).resolve()
+    if not project.is_dir():
+        die(f"project path is not a directory: {project}")
+    pbs = Path(args.pbs)
+    if not pbs.is_file():
+        # also look for it inside the project directory
+        pbs = project / args.pbs
+        if not pbs.is_file():
+            die(f"PBS file not found: {args.pbs}")
+
+    remote = f"{REMOTE_BASE}/{project.name}"
+    ensure_master()
+
+    print(f"[nscc] syncing {project} -> {HOST}:{remote}")
+    ssh_run(f"mkdir -p {remote}", check=False)
+    proc = subprocess.run(
+        [
+            "rsync", "-az", "--delete", "--exclude", ".git",
+            "-e", RSYNC_SSH,
+            f"{project}/", f"{HOST}:{remote}/",
+        ],
+    )
+    if proc.returncode != 0:
+        die(f"rsync failed with exit code {proc.returncode}")
+
+    print(f"[nscc] submitting {pbs.name}")
+    output = ssh_run(f"cd {remote} && qsub {pbs.name}", capture=True)
+    job_id = (output or "").strip().splitlines()[-1] if output else ""
+    log_action("submit", f"{project.name}/{pbs.name}", job_id)
+    if job_id:
+        print(f"[nscc] job submitted: {job_id} — watch with: nscc log {job_id.split('.')[0]} -f")
+
+
+def cmd_fetch(args):
+    """Download a URL on the NSCC login node — data never passes through
+    the local machine, so it can exceed local disk capacity."""
+    url = args.url
+    remote_dir = f"{REMOTE_BASE}/{args.project}/data"
+    ensure_master()
+    ssh_run(f"mkdir -p {remote_dir}")
+    # wget -c makes the download resumable if the connection drops
+    print(f"[nscc] fetching {url} on {HOST} (into {remote_dir})")
+    log_action("fetch", url, remote_dir)
+    ssh_run(
+        f"if command -v wget >/dev/null 2>&1; then "
+        f"wget -c -q --show-progress -P {remote_dir} '{url}'; "
+        f"else curl -L -C - -o {remote_dir}/$(basename '{url}') '{url}'; fi"
+    )
+
+
+def cmd_pull(args):
+    """rsync files from NSCC to this machine (over the master connection)."""
+    ensure_master()
+    remote = args.remote if ":" in args.remote else f"{HOST}:{args.remote}"
+    local = args.local or "."
+    log_action("pull", args.remote, local)
+    proc = subprocess.run(
+        ["rsync", "-azv", "--partial", "-e", RSYNC_SSH, remote, local],
+    )
+    if proc.returncode != 0:
+        die(f"rsync failed with exit code {proc.returncode}")
+
+
+def cmd_log(args):
+    """Show a job's stdout (default) or stderr, optionally following it.
+    Without a job id, picks the most recent job output under REMOTE_BASE."""
+    kind = "e" if args.err else "o"
+    if args.job_id:
+        jid = args.job_id.split(".")[0]
+        pattern = f"{REMOTE_BASE}/*/*.{kind}{jid}"
+    else:
+        pattern = f"{REMOTE_BASE}/*/*.{kind}*"
+    ensure_master()
+    # A job's output file only appears once it starts; if an id was given,
+    # wait a bit in case the job is still queued.
+    attempts = 10 if args.job_id else 1
+    found = ""
+    for i in range(attempts):
+        found = ssh_run(
+            f"ls -t {pattern} 2>/dev/null | head -1", capture=True, check=False
+        ).strip()
+        if found:
+            break
+        if i == 0 and args.job_id:
+            print(f"[nscc] waiting for job {jid} to start...", file=sys.stderr)
+        time.sleep(3)
+    if not found:
+        die(
+            f"no {'stderr' if args.err else 'stdout'} log found"
+            + (f" for job {args.job_id}" if args.job_id else "")
+        )
+    print(f"[nscc] {found}")
+    action = "tail -f" if args.follow else "cat"
+    log_action("log", found, action)
+    sys.exit(subprocess.run(["ssh", *SSH_OPTS, HOST, f"{action} '{found}'"]).returncode)
+
+
+def cmd_del(args):
+    jid = args.job_id.split(".")[0]
+    log_action("del", jid)
+    ssh_run(f"qdel {jid}")
+
+
+CONFIG_TEMPLATE = """\
+; nscc CLI per-user configuration (~/.nscc/config)
+; Fill in your own NSCC username below, then set your password:
+;   export {password_env}='your-password'   (in ~/.zshrc)
+; or uncomment 'password' below — the file is chmod 600, but an env var
+; is safer since this file must never be shared or committed.
+[nscc]
+host = your-user@aspire2a.nus.edu.sg
+remote_base = ~/nscc_submit
+password_env = {password_env}
+; password = your-password
+"""
+
+
+def cmd_init(args):
+    """Create a config template at ~/.nscc/config (never overwrites)."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    if os.path.exists(CONFIG_PATH):
+        die(f"config already exists: {CONFIG_PATH} — edit it instead")
+    with open(CONFIG_PATH, "w") as f:
+        f.write(CONFIG_TEMPLATE.format(password_env=DEFAULTS["password_env"]))
+    os.chmod(CONFIG_PATH, 0o600)
+    print(f"[nscc] created {CONFIG_PATH} (chmod 600) — edit it to set:")
+    print("  1. host: your NSCC username")
+    print(f"  2. export {DEFAULTS['password_env']}='your-password' in ~/.zshrc")
+
+
+def cmd_run(args):
+    ssh_run(args.command)
+
+
+def cmd_status(args):
+    ssh_run("qstat -u $USER")
+
+
+def cmd_ssh(args):
+    ensure_master()
+    # Attached to the user's terminal; if the master has expired by then,
+    # ssh simply prompts for the password interactively.
+    sys.exit(subprocess.run(["ssh", *SSH_OPTS, HOST]).returncode)
+
+
+def cmd_close(args):
+    subprocess.run(["ssh", *SSH_OPTS, "-O", "exit", HOST])
+    print("[nscc] master connection closed")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="nscc",
+        description="Submit jobs to NSCC ASPIRE 2A over password-authenticated SSH.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init", help="create a ~/.nscc/config template")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("submit", help="upload a project dir and qsub its PBS file")
+    p.add_argument("project", help="local project directory, e.g. ./my-project")
+    p.add_argument("pbs", help="PBS file (inside the project dir)")
+    p.set_defaults(func=cmd_submit)
+
+    p = sub.add_parser("fetch", help="download a URL directly on NSCC (bypasses local disk)")
+    p.add_argument("url", help="URL to download")
+    p.add_argument("project", help="project name; lands in ~/nscc_submit/<project>/data/")
+    p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("pull", help="copy files from NSCC to this machine")
+    p.add_argument("remote", help="remote path (nscc: prefix optional)")
+    p.add_argument("local", nargs="?", default=".", help="local destination (default: .)")
+    p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("run", help="run a command on the NSCC login node")
+    p.add_argument("command", help="command string, quoted")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("status", help="show qstat for this user")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("log", help="show a job's stdout (or --stderr); latest if no id")
+    p.add_argument("job_id", nargs="?", help="job id (e.g. 15207206; .pbs101 suffix ok)")
+    p.add_argument("--err", action="store_true", help="show stderr instead of stdout")
+    p.add_argument("-f", "--follow", action="store_true", help="tail -f the log")
+    p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("del", help="qdel a job")
+    p.add_argument("job_id", help="job id to delete")
+    p.set_defaults(func=cmd_del)
+
+    p = sub.add_parser("ssh", help="open an interactive login shell")
+    p.set_defaults(func=cmd_ssh)
+
+    p = sub.add_parser("close", help="close the shared master connection")
+    p.set_defaults(func=cmd_close)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
