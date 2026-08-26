@@ -5,8 +5,8 @@ Lives in `~/.nscc/nscc`, symlinked into `/opt/homebrew/bin/nscc`.
 
 ### Why
 
-The NSCC account (`zhu-chen@aspire2a.nus.edu.sg`) has no key-based SSH auth
-enabled, so every `ssh`/`rsync`/`qsub` requires typing the password by hand.
+The configured NSCC account may have no key-based SSH auth enabled, so every
+`ssh`/`rsync`/`qsub` can require typing the password by hand.
 This wraps the first connection in `expect`, feeding the password from the
 `MYPASS_XL` environment variable, and opens it as an SSH ControlMaster
 (`~/.ssh/nscc-*`). All subsequent ssh/rsync calls in the next 10 minutes
