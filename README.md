@@ -16,7 +16,7 @@ multiplex over that master — no password, and no pty in rsync's data path
 ### How to use
 
 ```bash
-nscc submit <project-path> <pbs-file>   # sync project to ~/nscc_submit/<name> + qsub
+nscc submit <project-path> <pbs-file>   # snapshot project to ~/nscc_submit/<name>/runs/<stamp>/ + qsub
 nscc fetch <url> <project-name>         # download URL directly on NSCC -> <name>/data/
 nscc pull <remote-path> [local-path]    # copy files from NSCC to this machine
 nscc run "<command>"                    # run any command on the login node
@@ -70,6 +70,21 @@ Security notes:
 - The same for `MYPASS_XL` in `~/.zshrc`: it is per-machine, per-user.
 - `~/.nscc/history.log` and job logs may contain paths/output — fine to
   share in debugging, but they are personal artifacts.
+
+### Remote layout
+
+```
+~/nscc_submit/<project>/
+├── data/              # shared data from `nscc fetch`; submit never touches it
+└── runs/<stamp>/      # one code snapshot per submit; the job runs and writes here
+    └── data -> ../../data   (symlink, when the project has no local data/)
+```
+
+Each submit uploads into a fresh `runs/<YYYYmmdd-HHMMSS>/` (unchanged files
+are hard-linked from the previous run via `rsync --link-dest`, so it stays
+fast). Resubmitting never deletes or overwrites earlier runs' outputs, and a
+running job keeps its own copy of the code. Clean up old runs by hand with
+`nscc run "rm -rf ~/nscc_submit/<project>/runs/<stamp>"`.
 
 ### Large data
 

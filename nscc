@@ -13,7 +13,7 @@ their binary protocol (expect's pty sits in the data path), so instead we:
 
 Usage:
     nscc init                               create a ~/.nscc/config template
-    nscc submit <project-path> <pbs-file>   upload project & qsub the job
+    nscc submit <project-path> <pbs-file>   snapshot project to runs/<stamp>/ & qsub
     nscc fetch <url> <project-name>         download a URL directly on NSCC
     nscc pull <remote-path> <local-path>    copy files from NSCC to this machine
     nscc run "<command>"                    run a command on the login node
@@ -195,25 +195,44 @@ def cmd_submit(args):
         if not pbs.is_file():
             die(f"PBS file not found: {args.pbs}")
 
-    remote = f"{REMOTE_BASE}/{project.name}"
+    # Each submit gets its own snapshot dir, so a resubmit never touches the
+    # code or outputs of earlier (possibly still running) jobs:
+    #   <remote_base>/<project>/data/            shared, filled by `nscc fetch`
+    #   <remote_base>/<project>/runs/<stamp>/    code snapshot + job outputs
+    project_root = f"{REMOTE_BASE}/{project.name}"
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = f"{project_root}/runs/{stamp}"
     ensure_master()
 
-    print(f"[nscc] syncing {project} -> {HOST}:{remote}")
-    ssh_run(f"mkdir -p {remote}", check=False)
-    proc = subprocess.run(
-        [
-            "rsync", "-az", "--delete", "--exclude", ".git",
-            "-e", RSYNC_SSH,
-            f"{project}/", f"{HOST}:{remote}/",
-        ],
-    )
+    # Unchanged files are hard-linked from the latest previous run instead of
+    # re-uploaded (rsync writes changed files as new inodes, so old runs stay
+    # intact).
+    prev = ssh_run(
+        f"mkdir -p {project_root}/runs && ls -1d {project_root}/runs/*/ 2>/dev/null | tail -1",
+        capture=True,
+    ).strip().rstrip("/")
+    if ssh_run(f"mkdir {run_dir}", check=False) != 0:
+        die(f"run dir already exists or cannot be created: {run_dir}")
+
+    print(f"[nscc] syncing {project} -> {HOST}:{run_dir}")
+    rsync_cmd = ["rsync", "-az", "--exclude", ".git", "-e", RSYNC_SSH]
+    if prev:
+        rsync_cmd += ["--link-dest", f"../{os.path.basename(prev)}"]
+    proc = subprocess.run(rsync_cmd + [f"{project}/", f"{HOST}:{run_dir}/"])
     if proc.returncode != 0:
         die(f"rsync failed with exit code {proc.returncode}")
 
-    print(f"[nscc] submitting {pbs.name}")
-    output = ssh_run(f"cd {remote} && qsub {pbs.name}", capture=True)
+    # Keep relative `data/` paths working: if the project has no local data/,
+    # point the run at the shared one.
+    ssh_run(
+        f"cd {run_dir} && [ ! -e data ] && [ -d ../../data ] && ln -s ../../data data || true",
+        check=False,
+    )
+
+    print(f"[nscc] submitting {pbs.name} from {run_dir}")
+    output = ssh_run(f"cd {run_dir} && qsub {pbs.name}", capture=True)
     job_id = (output or "").strip().splitlines()[-1] if output else ""
-    log_action("submit", f"{project.name}/{pbs.name}", job_id)
+    log_action("submit", f"{project.name}/runs/{stamp}/{pbs.name}", job_id)
     if job_id:
         print(f"[nscc] job submitted: {job_id} — watch with: nscc log {job_id.split('.')[0]} -f")
 
@@ -254,9 +273,11 @@ def cmd_log(args):
     kind = "e" if args.err else "o"
     if args.job_id:
         jid = args.job_id.split(".")[0]
-        pattern = f"{REMOTE_BASE}/*/*.{kind}{jid}"
+        suffix = f"*.{kind}{jid}"
     else:
-        pattern = f"{REMOTE_BASE}/*/*.{kind}*"
+        suffix = f"*.{kind}[0-9]*"
+    # runs/<stamp>/ is the current layout; <project>/ directly is the old one
+    pattern = f"{REMOTE_BASE}/*/runs/*/{suffix} {REMOTE_BASE}/*/{suffix}"
     ensure_master()
     # A job's output file only appears once it starts; if an id was given,
     # wait a bit in case the job is still queued.
